@@ -1,0 +1,9 @@
+streamlit
+python-dotenv
+pandas
+numpy
+scikit-learn
+requests
+langchain-core
+nba_api
+pytz
