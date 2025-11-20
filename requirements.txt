@@ -1,9 +1,7 @@
 streamlit
-python-dotenv
 pandas
-numpy
+python-dotenv
 scikit-learn
 requests
-langchain-core
-nba_api
 pytz
+langchain-core
