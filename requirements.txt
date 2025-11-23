@@ -5,3 +5,4 @@ scikit-learn
 requests
 pytz
 langchain-core
+nba_api
