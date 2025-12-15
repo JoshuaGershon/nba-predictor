@@ -1,6 +1,6 @@
 from __future__ import annotations
 from datetime import datetime
-from zoneinfo import ZoneInfo  # Python 3.9+
+from zoneinfo import ZoneInfo
 import os
 from typing import Dict, Any, List
 
@@ -17,37 +17,17 @@ from tools.features import (
 from tools.injuries import adjust_home_prob
 from tools.model import WinProbModel
 
-# ---------- one-time model bootstrap ----------
+
+# ============================
+# One-time model bootstrap
+# ============================
+
 MODEL = WinProbModel()
 
 
-# ---------- pipeline stages ----------
-
-def fetch_odds(_: Dict[str, Any]) -> Dict[str, Any]:
-    oc = OddsClient()
-    games = oc.get_nba_odds(markets=["h2h", "spreads", "totals"])
-    # keep only games with both team names
-    games = [g for g in games if g.get("home_team") and g.get("away_team")]
-    return {"games": games}
-
-
-def add_team_features(inp: Dict[str, Any]) -> Dict[str, Any]:
-    # Fast path: skip nba_api calls entirely if flagged
-    if os.getenv("SKIP_STATS") == "1":
-        out = []
-        for g in inp["games"]:
-            out.append({**g, "home_feats": {}, "away_feats": {}})
-        return {"games": out}
-
-    # Otherwise fetch rolling features normally
-    out = []
-    for g in inp["games"]:
-        home = g["home_team"]
-        away = g["away_team"]
-        home_feats = rolling_team_features(home, season=None, last_n=10)
-        away_feats = rolling_team_features(away, season=None, last_n=10)
-        out.append({**g, "home_feats": home_feats, "away_feats": away_feats})
-    return {"games": out}
+# ============================
+# Helpers
+# ============================
 
 def to_eastern(iso_str: str | None) -> str | None:
     if not iso_str:
@@ -59,92 +39,175 @@ def to_eastern(iso_str: str | None) -> str | None:
     except Exception:
         return iso_str
 
-def score_vs_market(inp: Dict[str, Any]) -> Dict[str, Any]:
-    scored: List[Dict[str, Any]] = []
+
+# ============================
+# Pipeline stages
+# ============================
+
+def fetch_odds(_: Dict[str, Any]) -> Dict[str, Any]:
+    oc = OddsClient()
+    games = oc.get_nba_odds(markets=["h2h", "spreads", "totals"])
+
+    # Keep only valid games
+    games = [g for g in games if g.get("home_team") and g.get("away_team")]
+    return {"games": games}
+
+
+def add_team_features(inp: Dict[str, Any]) -> Dict[str, Any]:
+    if os.getenv("SKIP_STATS") == "1":
+        return {
+            "games": [
+                {**g, "home_feats": {}, "away_feats": {}}
+                for g in inp["games"]
+            ]
+        }
+
+    out = []
     for g in inp["games"]:
         home = g["home_team"]
         away = g["away_team"]
 
-        # build features for model
+        home_feats = rolling_team_features(home, season=None, last_n=10)
+        away_feats = rolling_team_features(away, season=None, last_n=10)
+
+        out.append({**g, "home_feats": home_feats, "away_feats": away_feats})
+
+    return {"games": out}
+
+
+def score_vs_market(inp: Dict[str, Any]) -> Dict[str, Any]:
+    scored: List[Dict[str, Any]] = []
+
+    for g in inp["games"]:
+        home = g["home_team"]
+        away = g["away_team"]
+
+        # ============================
+        # Model probability
+        # ============================
+
         row = build_feature_row(home, away, g["home_feats"], g["away_feats"])
-
-        # model probabilities
         p_home = MODEL.predict_proba(row)
-
-        # manual injury/absence adjustment from injuries.json
         p_home = adjust_home_prob(home, away, p_home)
         p_away = 1.0 - p_home
 
-        # market
-        home_ml = g["markets"]["h2h"]["home_price"]
-        away_ml = g["markets"]["h2h"]["away_price"]
-        imp_home = american_to_implied(home_ml)
-        imp_away = american_to_implied(away_ml)
+        # ============================
+        # MONEYLINE MARKET
+        # ============================
 
-        # EV + Kelly
-        ev_home = ev_away = None
-        kelly_home = kelly_away = None
-        if home_ml is not None:
-            ev_home = ev_from_prob(p_home, home_ml)
-            kelly_home = kelly_fraction(p_home, home_ml)
-        if away_ml is not None:
-            ev_away = ev_from_prob(p_away, away_ml)
-            kelly_away = kelly_fraction(p_away, away_ml)
+        ml_home = g["markets"]["h2h"]["home_price"]
+        ml_away = g["markets"]["h2h"]["away_price"]
 
-        rec = {
-            "commence_time": to_eastern(g.get("commence_time")),
-            "home": home,
-            "away": away,
-            "moneyline": {"home": home_ml, "away": away_ml},
-            "spreads": g["markets"]["spreads"],
-            "totals": g["markets"]["totals"],
-            "model": {
-                "home_win_prob": round(p_home, 4),
-                "away_win_prob": round(p_away, 4),
-            },
-            "market_implied": {
-                "home": round(imp_home, 4) if imp_home is not None else None,
-                "away": round(imp_away, 4) if imp_away is not None else None,
-            },
-            "edge": {
-                "home": round((p_home - (imp_home or 0.0)), 4) if imp_home is not None else None,
-                "away": round((p_away - (imp_away or 0.0)), 4) if imp_away is not None else None,
-            },
-            "ev": {
-                "home": round(ev_home, 4) if ev_home is not None else None,
-                "away": round(ev_away, 4) if ev_away is not None else None,
-            },
-            "kelly": {
-                "home": round(kelly_home, 4) if kelly_home is not None else None,
-                "away": round(kelly_away, 4) if kelly_away is not None else None,
-            },
-        }
-        scored.append(rec)
+        ev_ml_home = ev_ml_away = None
+        k_ml_home = k_ml_away = None
+
+        if ml_home is not None:
+            ev_ml_home = ev_from_prob(p_home, ml_home)
+            k_ml_home = kelly_fraction(p_home, ml_home)
+
+        if ml_away is not None:
+            ev_ml_away = ev_from_prob(p_away, ml_away)
+            k_ml_away = kelly_fraction(p_away, ml_away)
+
+        # ============================
+        # SPREAD MARKET (new)
+        # ============================
+
+        spread = g["markets"]["spreads"]
+        spread_home = spread.get("home_point")
+        spread_away = spread.get("away_point")
+        spread_odds_home = spread.get("home_price")
+        spread_odds_away = spread.get("away_price")
+
+        # Simple heuristic: reuse win prob as proxy
+        # (we’ll improve this later with margin models)
+        ev_spread_home = ev_spread_away = None
+        k_spread_home = k_spread_away = None
+
+        if spread_odds_home is not None:
+            ev_spread_home = ev_from_prob(p_home, spread_odds_home)
+            k_spread_home = kelly_fraction(p_home, spread_odds_home)
+
+        if spread_odds_away is not None:
+            ev_spread_away = ev_from_prob(p_away, spread_odds_away)
+            k_spread_away = kelly_fraction(p_away, spread_odds_away)
+
+        scored.append(
+            {
+                "commence_time": to_eastern(g.get("commence_time")),
+                "home": home,
+                "away": away,
+
+                "model": {
+                    "p_home": round(p_home, 4),
+                    "p_away": round(p_away, 4),
+                },
+
+                "moneyline": {
+                    "home": ml_home,
+                    "away": ml_away,
+                    "ev_home": ev_ml_home,
+                    "ev_away": ev_ml_away,
+                    "kelly_home": k_ml_home,
+                    "kelly_away": k_ml_away,
+                },
+
+                "spread": {
+                    "line_home": spread_home,
+                    "line_away": spread_away,
+                    "price_home": spread_odds_home,
+                    "price_away": spread_odds_away,
+                    "ev_home": ev_spread_home,
+                    "ev_away": ev_spread_away,
+                    "kelly_home": k_spread_home,
+                    "kelly_away": k_spread_away,
+                },
+            }
+        )
+
     return {"scored": scored}
 
 
 def rank_recs(inp: Dict[str, Any]) -> Dict[str, Any]:
-    items = []
+    ranked = []
+
     for g in inp["scored"]:
-        home_ev = g["ev"]["home"]
-        away_ev = g["ev"]["away"]
-        if home_ev is not None or away_ev is not None:
-            best_side = "home" if (home_ev or -9) >= (away_ev or -9) else "away"
-            best_metric = home_ev if best_side == "home" else away_ev
-            metric_name = "EV"
-        else:
-            home_edge = g["edge"]["home"]
-            away_edge = g["edge"]["away"]
-            best_side = "home" if (home_edge or -9) >= (away_edge or -9) else "away"
-            best_metric = home_edge if best_side == "home" else away_edge
-            metric_name = "edge"
-        items.append({**g, "best_side": best_side, "best_metric": best_metric, "metric_name": metric_name})
+        candidates = []
 
-    items.sort(key=lambda r: (r["best_metric"] if r["best_metric"] is not None else -999), reverse=True)
-    return {"recommendations": items}
+        # Moneyline sides
+        if g["moneyline"]["ev_home"] is not None:
+            candidates.append(("moneyline", "home", g["moneyline"]["ev_home"]))
+        if g["moneyline"]["ev_away"] is not None:
+            candidates.append(("moneyline", "away", g["moneyline"]["ev_away"]))
+
+        # Spread sides
+        if g["spread"]["ev_home"] is not None:
+            candidates.append(("spread", "home", g["spread"]["ev_home"]))
+        if g["spread"]["ev_away"] is not None:
+            candidates.append(("spread", "away", g["spread"]["ev_away"]))
+
+        if not candidates:
+            continue
+
+        best_market, best_side, best_ev = max(candidates, key=lambda x: x[2])
+
+        ranked.append(
+            {
+                **g,
+                "best_market": best_market,
+                "best_side": best_side,
+                "best_ev": best_ev,
+            }
+        )
+
+    ranked.sort(key=lambda r: r["best_ev"], reverse=True)
+    return {"recommendations": ranked}
 
 
-# ---------- public runnable ----------
+# ============================
+# Public runnable
+# ============================
+
 NBA_CHAIN = (
     RunnablePassthrough()
     | RunnableLambda(fetch_odds)
