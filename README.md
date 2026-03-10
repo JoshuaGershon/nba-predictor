@@ -1,5 +1,6 @@
 # NBA Game Prediction Model
-
+Live Demo:
+https://nba-predictor-aroqktfmngvzvzezeusawo.streamlit.app/
 This project uses historical NBA game statistics to predict game outcomes.
 
 Tools:
